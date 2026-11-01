@@ -25,6 +25,10 @@ class Venue:
         self.calls = []
         self.post_count = 0
         self.partial = False
+        self.reject_all = False
+        self.cancel_on_post = False
+        self.partial_cancel_on_post = False
+        self.fail_confirm = False
         self.timeout_after_post = False
         self.omit_result = False
         self.reverse = True
@@ -74,11 +78,16 @@ class Venue:
                 raise AssertionError("Invalid placement batch size")
             added, failed = [], []
             for index, item in enumerate(items):
-                if self.partial and index > 0:
+                if self.reject_all or (self.partial and index > 0):
                     failed.append({"order": item, "error": "insufficient margin", "errorCode": "insufficient_margin"})
                     continue
                 order_id = str(len(self.orders) + 1)
                 order = dict(item, orderId=order_id, status="open", filledSize="0")
+                if self.cancel_on_post or self.partial_cancel_on_post:
+                    order["status"] = "canceled"
+                    order["cancelReason"] = "selfMatchPrevention"
+                    if self.partial_cancel_on_post:
+                        order["filledSize"] = "0.005"
                 self.orders[order_id] = order
                 added.append(dict(order))
             if self.timeout_after_post:
@@ -107,7 +116,7 @@ class Venue:
         elif path.startswith("/v1/perps/orders/"):
             order_id = path.rsplit("/", 1)[1]
             if order_id.startswith("client:"):
-                result = next((dict(order) for order in self.orders.values() if order["clientOrderId"] == order_id[7:]), None)
+                result = None if self.fail_confirm else next((dict(order) for order in self.orders.values() if order["clientOrderId"] == order_id[7:]), None)
             else:
                 result = dict(self.orders[order_id]) if order_id in self.orders else None
             if result is None:
@@ -139,6 +148,9 @@ class GridTests(unittest.TestCase):
         log_patch = patch("ondo_grid.logger")
         log_patch.start()
         self.addCleanup(log_patch.stop)
+        exchange_log_patch = patch("ondo_exchange.logger")
+        self.exchange_logger = exchange_log_patch.start()
+        self.addCleanup(exchange_log_patch.stop)
         self.venue = Venue()
         self.exchange = OndoExchange("test-key", "test-secret")
         self.exchange._session.send = Mock(side_effect=self.venue.send)
@@ -148,6 +160,7 @@ class GridTests(unittest.TestCase):
 
     def placed(self):
         self.trader.place_grid_orders()
+        self.trader.poller()
         return [call for call in self.venue.calls if call.method == "POST"]
 
     def test_symbols_are_native_everywhere(self):
@@ -206,29 +219,152 @@ class GridTests(unittest.TestCase):
         self.assertEqual(self.trader.myNewPrice, 1970)
         self.assertEqual(self.venue.post_count, 3)
         self.trader.place_grid_orders()
+        self.trader.poller()
         self.assertEqual(self.venue.post_count, 6)
         self.assertEqual(len(self.exchange.fetch_open_orders("ETH")), 60)
 
-    def test_partial_failure_records_success_and_stops_remaining_batches(self):
+    def test_partial_failure_records_success_and_retries_only_failed_orders(self):
         self.venue.partial = True
-        with self.assertRaisesRegex(OndoFatalError, "insufficient_margin"):
-            self.placed()
-        self.assertEqual(self.venue.post_count, 1)
-        self.assertEqual(len(self.trader.All_orders), 1)
+        self.placed()
+        self.assertEqual(self.venue.post_count, 3)
+        self.assertEqual(len(self.trader.All_orders), 3)
+        self.assertEqual(len(self.trader.pending_orders), 57)
+        previous_ids = {item["clientOrderId"] for item in self.trader.pending_orders}
+        accepted_ids = {item["clientOrderId"] for item in self.venue.orders.values()}
+        self.venue.partial = False
+        self.trader.poller()
+        posts = [call for call in self.venue.calls if call.method == "POST"]
+        retried = [item for call in posts[3:] for item in json.loads(call.body)["orders"]]
+        self.assertEqual([len(json.loads(call.body)["orders"]) for call in posts[3:]], [20, 20, 17])
+        self.assertFalse({item["clientOrderId"] for item in retried} & (previous_ids | accepted_ids))
+        self.assertEqual(len(self.venue.orders), 60)
+        self.assertEqual(len(self.trader.All_orders), 60)
+        self.assertEqual(self.trader.pending_orders, [])
 
-    def test_partial_failure_in_run_exits_and_cancels(self):
+    def test_partial_failure_in_run_continues_and_recovers(self):
         self.venue.partial = True
+        self.trader.cancel_on_exit = False
+        def next_poll(seconds):
+            self.assertEqual(seconds, 0.8)
+            if self.venue.partial:
+                self.venue.partial = False
+            else:
+                raise KeyboardInterrupt()
+        self.sleep_mock.side_effect = next_poll
+        with self.assertRaises(SystemExit) as stopped:
+            self.trader.run()
+        self.assertEqual(stopped.exception.code, 0)
+        self.assertEqual(self.trader.critical_errors, 0)
+        self.assertEqual(self.trader.myloop, 2)
+        self.assertEqual(len(self.exchange.fetch_open_orders("ETH")), 60)
+        self.assertFalse(any(call.method == "DELETE" for call in self.venue.calls))
+
+    def test_failed_replacements_stay_tracked_and_are_not_queued_twice(self):
+        self.placed()
+        for order_id in ("1", "2", "3"):
+            self.venue.orders[order_id].update(status="fullyfilled", filledSize="0.01")
+        self.venue.partial = True
+        self.trader.poller()
+        self.assertNotIn("1", self.trader.All_orders)
+        self.assertIn("2", self.trader.All_orders)
+        self.assertIn("3", self.trader.All_orders)
+        self.assertEqual(self.trader.counter, 1)
+        self.assertEqual(self.trader.last_fill_price, 1999)
+        self.venue.reject_all = True
+        self.venue.orders["4"].update(status="fullyfilled", filledSize="0.01")
+        for _ in range(3):
+            self.trader.poller()
+            self.assertEqual(len(self.trader.pending_orders), 3)
+            self.assertEqual({item["old_id"] for item in self.trader.pending_orders}, {"2", "3", "4"})
+            self.assertEqual(self.trader.counter, 1)
+        self.venue.reject_all = False
+        self.venue.partial = False
+        self.trader.poller()
+        self.assertEqual(self.trader.pending_orders, [])
+        self.assertEqual(len(self.trader.All_orders), 60)
+        self.assertEqual(self.trader.counter, 4)
+
+    def test_edge_rebuild_discards_old_queue_only_after_cancellation_succeeds(self):
+        self.placed()
+        self.venue.reject_all = True
+        self.venue.orders["1"].update(status="fullyfilled", filledSize="0.01")
+        self.trader.poller()
+        old_queue = list(self.trader.pending_orders)
+        post_count = self.venue.post_count
+        self.venue.orders["59"].update(status="fullyfilled", filledSize="0.01")
+        self.trader.poller()
+        self.assertEqual(self.venue.post_count, post_count)
+        self.assertTrue(self.trader.switc)
+        self.venue.keep_open.add("2")
+        with self.assertRaises(RuntimeError):
+            self.trader.place_grid_orders()
+        self.assertEqual(self.trader.pending_orders, old_queue)
+        self.venue.keep_open.clear()
+        self.venue.reject_all = False
+        self.trader.place_grid_orders()
+        self.assertEqual(len(self.trader.pending_orders), 60)
+        self.assertTrue(all("old_id" not in item for item in self.trader.pending_orders))
+        self.trader.poller()
+        self.assertEqual(self.trader.pending_orders, [])
+        self.assertEqual(len(self.exchange.fetch_open_orders("ETH")), 60)
+        self.assertEqual(self.trader.counter, 0)
+
+    def test_too_few_orders_check_resumes_after_queue_drains(self):
+        self.venue.reject_all = True
+        self.placed()
+        self.trader.poller()  # 零挂单但有待提交订单，允许继续恢复。
+        self.assertEqual(len(self.trader.pending_orders), 60)
+        self.venue.reject_all = False
+        self.trader.poller()
+        for order in self.venue.orders.values():
+            order["status"] = "canceled"
+        with self.assertRaises(SystemExit):
+            self.trader.poller()
+
+    def test_pending_orders_do_not_disable_position_or_excess_order_risk(self):
+        self.venue.reject_all = True
+        self.placed()
+        self.venue.position = 2
+        with self.assertRaises(SystemExit):
+            self.trader.accountInfo()
+        self.venue.position = 0
+        self.venue.orders = {
+            str(index): {
+                "orderId": str(index), "clientOrderId": f"extra_{index}",
+                "market": "ETH-USD.P", "side": "buy", "price": "1999",
+                "size": "0.01", "filledSize": "0", "status": "open",
+            } for index in range(65)
+        }
+        with self.assertRaises(SystemExit):
+            self.trader.accountInfo()
+        self.assertEqual(self.exchange.fetch_open_orders("ETH"), [])
+
+    def test_account_risk_still_runs_every_twenty_loops_during_placement_failures(self):
+        self.venue.reject_all = True
+        self.trader.accountInfo = Mock(wraps=self.trader.accountInfo)
+        def next_poll(seconds):
+            self.assertEqual(seconds, 0.8)
+            if self.trader.myloop == 20:
+                self.venue.position = 2
+        self.sleep_mock.side_effect = next_poll
         with self.assertRaises(SystemExit) as stopped:
             self.trader.run()
         self.assertEqual(stopped.exception.code, 1)
-        self.assertEqual(self.exchange.fetch_open_orders("ETH"), [])
+        self.assertEqual(self.trader.myloop, 20)
+        self.assertEqual(self.trader.accountInfo.call_count, 2)
 
-    def test_partial_failure_can_leave_orders_when_risk_cancel_disabled(self):
-        self.venue.partial = True
-        self.trader.cancel_on_risk = False
+    def test_all_placement_failures_keep_running_without_critical_errors(self):
+        self.venue.reject_all = True
+        self.trader.cancel_on_exit = False
+        self.sleep_mock.side_effect = [None] * 4 + [KeyboardInterrupt()]
         with self.assertRaises(SystemExit):
             self.trader.run()
-        self.assertEqual(len(self.exchange.fetch_open_orders("ETH")), 1)
+        self.assertEqual(self.trader.myloop, 5)
+        self.assertEqual(self.trader.critical_errors, 0)
+        self.assertEqual(self.venue.post_count, 15)
+        self.assertEqual(self.trader.All_orders, {})
+        self.assertEqual(len(self.trader.pending_orders), 60)
+        self.assertTrue(all(call.args == (0.8,) for call in self.sleep_mock.call_args_list))
 
     def test_timeout_and_missing_response_confirm_without_reposting(self):
         for flag in ("timeout_after_post", "omit_result"):
@@ -245,16 +381,68 @@ class GridTests(unittest.TestCase):
                 self.assertEqual(self.venue.post_count - before, 1)
                 setattr(self.venue, flag, False)
 
-    def test_unconfirmed_orders_stop_without_reposting(self):
+    def test_unconfirmed_orders_are_queued_with_confirmation_error_details(self):
         self.exchange._request = Mock(side_effect=[
             OndoAPIError("timeout", uncertain=True),
             OndoAPIError("missing", code="order_not_found"),
             OndoAPIError("missing", code="order_not_found"),
             OndoAPIError("missing", code="order_not_found"),
         ])
-        with self.assertRaisesRegex(OndoFatalError, "order_unconfirmed"):
-            self.trader.submit_orders([{"side": "buy", "price": 1999, "edge": 0}])
+        self.trader.pending_orders = [{"side": "buy", "price": 1999, "edge": 0}]
+        self.trader.submit_orders()
+        self.assertEqual(len(self.trader.pending_orders), 1)
+        self.assertEqual(self.trader.critical_errors, 0)
         self.assertEqual([call.args[0] for call in self.exchange._request.call_args_list], ["POST", "GET", "GET", "GET"])
+        warnings = [call.args[0] for call in self.exchange_logger.warning.call_args_list]
+        self.assertTrue(any("attempt=3/3" in warning and "missing" in warning for warning in warnings))
+
+    def test_unconfirmed_replacement_retries_with_new_client_id_next_poll(self):
+        self.placed()
+        self.venue.orders["1"].update(status="fullyfilled", filledSize="0.01")
+        self.venue.timeout_after_post = True
+        self.venue.fail_confirm = True
+        self.trader.poller()
+        self.assertEqual(len(self.trader.pending_orders), 1)
+        first_client_id = self.trader.pending_orders[0]["clientOrderId"]
+        self.assertIn("1", self.trader.All_orders)
+        self.assertEqual(self.trader.counter, 0)
+        self.venue.timeout_after_post = False
+        self.venue.fail_confirm = False
+        self.trader.poller()
+        self.assertEqual(self.trader.pending_orders, [])
+        self.assertNotIn("1", self.trader.All_orders)
+        self.assertEqual(self.trader.counter, 1)
+        self.assertEqual(self.venue.post_count, 5)
+        self.assertNotEqual(first_client_id, self.venue.orders["62"]["clientOrderId"])
+        # 按用户选择，未知但实际已成功的上一笔会留下额外挂单。
+        self.assertEqual(len(self.exchange.fetch_open_orders("ETH")), 61)
+
+    def test_canceled_zero_fill_is_explicit_failure_in_batch_and_confirmation(self):
+        self.venue.cancel_on_post = True
+        for lost_response in (False, True):
+            with self.subTest(lost_response=lost_response):
+                self.venue.timeout_after_post = lost_response
+                result = self.exchange.create_orders("ETH", [{"side": "buy", "amount": "0.01", "price": 1999}])
+                self.assertEqual(result["addedOrders"], [])
+                self.assertEqual(result["failedOrders"][0]["errorCode"], "order_canceled")
+                self.assertIn("selfMatchPrevention", result["failedOrders"][0]["error"])
+
+    def test_canceled_zero_fill_recovers_next_poll(self):
+        self.venue.cancel_on_post = True
+        self.placed()
+        self.assertEqual(len(self.trader.pending_orders), 60)
+        self.assertEqual(self.trader.All_orders, {})
+        self.venue.cancel_on_post = False
+        self.trader.poller()
+        self.assertEqual(self.trader.pending_orders, [])
+        self.assertEqual(len(self.exchange.fetch_open_orders("ETH")), 60)
+
+    def test_partial_fill_cancellation_remains_fatal(self):
+        self.venue.partial_cancel_on_post = True
+        with self.assertRaises(SystemExit) as stopped:
+            self.trader.run()
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(self.venue.post_count, 1)
 
     def test_sixty_cancellations_use_three_batches(self):
         self.placed()
@@ -312,16 +500,28 @@ class GridTests(unittest.TestCase):
         self.assertEqual(self.venue.post_count, 1)
         self.assertFalse(any("client:" in call.url for call in self.venue.calls))
 
-    def test_rate_limit_after_first_batch_rebuilds_without_duplicate_orders(self):
+    def test_rate_limit_keeps_failed_batch_and_continues_other_batches(self):
+        self.venue.rate_limit_post = 2
+        self.placed()
+        self.assertEqual(self.venue.post_count, 3)
+        self.assertEqual(len(self.trader.All_orders), 40)
+        self.assertEqual(len(self.trader.pending_orders), 20)
+        self.trader.poller()
+        self.assertEqual(self.venue.post_count, 4)
+        self.assertEqual(len(self.exchange.fetch_open_orders("ETH")), 60)
+        self.assertEqual(self.trader.pending_orders, [])
+        self.assertFalse(any(call.method == "DELETE" for call in self.venue.calls))
+
+    def test_rate_limit_in_run_keeps_normal_poll_interval(self):
         self.venue.rate_limit_post = 2
         self.trader.cancel_on_exit = False
-        self.sleep_mock.side_effect = lambda seconds: (_ for _ in ()).throw(KeyboardInterrupt()) if seconds == 0.8 else None
+        self.sleep_mock.side_effect = [None, KeyboardInterrupt()]
         with self.assertRaises(SystemExit) as stopped:
             self.trader.run()
         self.assertEqual(stopped.exception.code, 0)
-        self.assertEqual(self.venue.post_count, 5)
+        self.assertEqual(self.venue.post_count, 4)
         self.assertEqual(len(self.exchange.fetch_open_orders("ETH")), 60)
-        self.sleep_mock.assert_any_call(5)
+        self.assertTrue(all(call.args == (0.8,) for call in self.sleep_mock.call_args_list))
 
     def test_consecutive_read_errors_reach_critical_limit(self):
         self.trader.myloop = 1

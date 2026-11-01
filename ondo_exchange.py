@@ -1,11 +1,15 @@
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from urllib.parse import urlsplit
+
+
+logger = logging.getLogger(__name__)
 
 
 class OndoFatalError(RuntimeError):
@@ -356,7 +360,8 @@ class OndoExchange:
         except OndoAPIError as exc:
             if not exc.uncertain:
                 raise
-            response = {}
+            logger.warning(f"Ondo batch placement result uncertain: {exc}; confirming by clientOrderId")
+            response = {"result": {"addedOrders": [], "failedOrders": []}}
 
         added, failed = {}, {}
         try:
@@ -368,27 +373,35 @@ class OndoExchange:
                 request = requests[client_id]
                 order = self._parse_order(raw)
                 if (
-                    client_id in added or order["symbol"] != market["symbol"]
+                    client_id in added or client_id in failed or order["symbol"] != market["symbol"]
                     or order["side"] != request["side"]
                     or Decimal(raw["size"]) != Decimal(request["size"])
                     or Decimal(raw["price"]) != Decimal(request["price"])
-                    or order["status"] not in {"open", "pending", "filled"}
+                    or order["status"] not in {"open", "pending", "filled", "canceled"}
                     or order["id"] in {value["id"] for value in added.values()}
                 ):
                     raise ValueError("Inconsistent Ondo batch order")
-                added[client_id] = order
+                if order["status"] == "canceled":
+                    failed[client_id] = {
+                        "order": request, "errorCode": "order_canceled",
+                        "error": f'Canceled without fills: {raw.get("cancelReason") or "unspecified"}',
+                    }
+                else:
+                    added[client_id] = order
             for item in result["failedOrders"]:
                 client_id = item["order"]["clientOrderId"]
                 if client_id not in requests or client_id in added or client_id in failed:
                     raise ValueError("Inconsistent Ondo batch failure")
                 failed[client_id] = item
-        except (KeyError, TypeError, ValueError, InvalidOperation):
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             # 格式异常时重新确认整批，不能依赖不完整的响应顺序或数量。
+            logger.warning(f"Ondo batch response invalid: {type(exc).__name__}: {exc}; confirming by clientOrderId")
             added, failed = {}, {}
 
         for client_id, request in requests.items():
             if client_id in added or client_id in failed:
                 continue
+            last_error = "No matching order in batch response"
             for attempt in range(3):
                 if attempt:
                     time.sleep(0.5)
@@ -402,17 +415,25 @@ class OndoExchange:
                         and order["side"] == request["side"]
                         and Decimal(raw["size"]) == Decimal(request["size"])
                         and Decimal(raw["price"]) == Decimal(request["price"])
-                        and order["status"] in {"open", "pending", "filled"}
+                        and order["status"] in {"open", "pending", "filled", "canceled"}
                         and order["id"] not in {value["id"] for value in added.values()}
                     ):
-                        added[client_id] = order
+                        if order["status"] == "canceled":
+                            failed[client_id] = {
+                                "order": request, "errorCode": "order_canceled",
+                                "error": f'Canceled without fills: {raw.get("cancelReason") or "unspecified"}',
+                            }
+                        else:
+                            added[client_id] = order
                         break
-                except (OndoAPIError, KeyError, TypeError, ValueError, InvalidOperation):
-                    continue
-            if client_id not in added:
+                    raise ValueError("Ondo confirmation did not match the requested order")
+                except (OndoAPIError, KeyError, TypeError, ValueError, InvalidOperation) as exc:
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    logger.warning(f"Confirm Ondo order client_id={client_id}, attempt={attempt + 1}/3 failed: {last_error}")
+            if client_id not in added and client_id not in failed:
                 failed[client_id] = {
                     "order": request, "errorCode": "order_unconfirmed",
-                    "error": "Cannot confirm order; stop to avoid duplicate placement",
+                    "error": f"Cannot confirm order; retry next poll; last error: {last_error}",
                 }
         return {"addedOrders": list(added.values()), "failedOrders": list(failed.values())}
 

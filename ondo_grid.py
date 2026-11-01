@@ -12,7 +12,7 @@ import uuid
 from decimal import Decimal
 
 from dotenv import load_dotenv
-from ondo_exchange import OndoExchange, OndoFatalError
+from ondo_exchange import OndoAPIError, OndoExchange, OndoFatalError
 
 
 logger = logging.getLogger(__name__)
@@ -65,6 +65,7 @@ class GridTrader:
 
         # 仅跟踪本进程订单；baseline/left 只计算日志目标仓位，不自动调仓。
         self.All_orders = {}
+        self.pending_orders = []
         self.switc = True
         self.myloop = 0
         self.counter = 0
@@ -154,14 +155,19 @@ class GridTrader:
                 exit_after=True,
             )
 
-    def submit_orders(self, pending):
-        # 铺单和补单共用批量提交及记账流程；返回顺序可能与请求顺序不同。
+    def submit_orders(self):
+        # 每轮只遍历队列快照一次；失败项留在队列，下轮使用新客户端 ID 重试。
+        pending = list(self.pending_orders)
         for offset in range(0, len(pending), 20):
             batch = pending[offset:offset + 20]
             for item in batch:
                 item["clientOrderId"] = "grid_" + uuid.uuid4().hex
                 item["amount"] = self.amount
-            result = self.exchange.create_orders(self.symbol, batch)
+            try:
+                result = self.exchange.create_orders(self.symbol, batch)
+            except OndoAPIError as exc:
+                logger.warning(f"Ondo batch placement failed, retry next poll: {exc}")
+                continue
             added = {order["clientOrderId"]: order for order in result["addedOrders"]}
             for item in batch:
                 order = added.get(item["clientOrderId"])
@@ -177,15 +183,15 @@ class GridTrader:
                     logger.info(f"Filled id={old_id}, placed {order['side']} id={order['id']} price={order['price']}, count={self.counter}")
                 else:
                     logger.info(f"Placed {order['side']} id={order['id']} amount={order['amount']} price={order['price']}")
+                self.pending_orders.remove(item)
             if result["failedOrders"]:
                 details = [
                     f"{item['order']['clientOrderId']}: {item.get('errorCode', '')} {item.get('error', '')}"
                     for item in result["failedOrders"]
                 ]
-                raise OndoFatalError("Ondo batch placement failed: " + "; ".join(details))
+                logger.warning("Ondo batch placement failed, retry next poll: " + "; ".join(details))
 
     def place_grid_orders(self):
-        self.switc = False
         if self.myNewPrice == 0:
             self.accountInfo()
         half = self.gridLines // 2
@@ -202,15 +208,16 @@ class GridTrader:
                 pending.append({"side": side, "price": price, "edge": int(i == half)})
         self.cancel_open_orders("grid reset")
         self.All_orders.clear()
-        self.submit_orders(pending)
-        logger.info("Grid orders placed")
+        self.pending_orders = pending
+        self.switc = False
+        logger.info(f"Grid prepared: {len(pending)} orders queued")
 
     def poller(self):
         # 查询失败向主循环报告，不将失败响应当作空挂单列表。
         orders = self.exchange.fetch_open_orders(self.symbol)
         if orders is None:
             raise RuntimeError("Ondo returned no open orders response")
-        if len(orders) < self.gridLines // 3:
+        if not self.pending_orders and len(orders) < self.gridLines // 3:
             self.critical(
                 f"Risk control triggered: too few open orders, orders={len(orders)}, minimum={self.gridLines // 3}",
                 exit_after=True,
@@ -230,16 +237,18 @@ class GridTrader:
             self.switc = True
             logger.info(f"Edge order filled id={order_id}, reset grid at {self.myNewPrice}")
             return
-        pending = []
+        queued_old_ids = {item.get("old_id") for item in self.pending_orders}
         for order_id in filled_ids:
+            if order_id in queued_old_ids:
+                continue
             _, old_price, old_side = self.All_orders[order_id]
             side = "sell" if old_side == "buy" else "buy"
             price = old_price + self.gridStep if old_side == "buy" else old_price - self.gridStep
-            pending.append({
+            self.pending_orders.append({
                 "side": side, "price": price, "edge": 0,
                 "old_id": order_id, "old_price": old_price,
             })
-        self.submit_orders(pending)
+        self.submit_orders()
 
     def run(self):
         logger.info(f"Program started: symbol={self.symbol}, gridStep={self.gridStep}, orderSize={self.amount}")
@@ -285,6 +294,10 @@ if __name__ == "__main__":
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
+    exchange_logger = logging.getLogger("ondo_exchange")
+    exchange_logger.setLevel(logger.level)
+    exchange_logger.handlers = list(logger.handlers)
+    exchange_logger.propagate = False
     exchange = OndoExchange.from_env()
     try:
         GridTrader(exchange).run()
