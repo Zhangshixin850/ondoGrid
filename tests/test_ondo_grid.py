@@ -31,6 +31,7 @@ class Venue:
         self.fail_confirm = False
         self.timeout_after_post = False
         self.omit_result = False
+        self.batch_result_transform = None
         self.reverse = True
         self.rate_limit_post = 0
         self.keep_open = set()
@@ -96,6 +97,8 @@ class Venue:
                 "addedOrders": list(reversed(added)) if self.reverse else added,
                 "failedOrders": failed,
             }
+            if self.batch_result_transform is not None:
+                result = self.batch_result_transform(result)
         elif path == "/v1/perps/orders/batch" and request.method == "DELETE":
             if body:
                 raise AssertionError("Cancellation IDs belong in the query, not body")
@@ -380,6 +383,198 @@ class GridTests(unittest.TestCase):
                 self.assertEqual(result["failedOrders"], [])
                 self.assertEqual(self.venue.post_count - before, 1)
                 setattr(self.venue, flag, False)
+
+    def test_optional_failure_collection_preserves_success_without_queries(self):
+        for variant in ("empty", "missing", "null"):
+            with self.subTest(variant=variant):
+                def transform(result):
+                    if variant == "missing":
+                        result.pop("failedOrders")
+                    else:
+                        result["failedOrders"] = None if variant == "null" else []
+                    return result
+                self.venue.batch_result_transform = transform
+                self.venue.calls.clear()
+                self.exchange_logger.reset_mock()
+                result = self.exchange.create_orders("ETH", [
+                    {"side": "buy", "amount": "0.01", "price": "1999"},
+                    {"side": "sell", "amount": "0.01", "price": "2001"},
+                ])
+                self.assertEqual(len(result["addedOrders"]), 2)
+                self.assertEqual(result["failedOrders"], [])
+                self.assertEqual([call.method for call in self.venue.calls], ["POST"])
+                self.exchange_logger.warning.assert_not_called()
+
+    def test_optional_success_collection_preserves_explicit_failures_without_queries(self):
+        self.venue.reject_all = True
+        for variant in ("empty", "missing", "null"):
+            with self.subTest(variant=variant):
+                def transform(result):
+                    if variant == "missing":
+                        result.pop("addedOrders")
+                    else:
+                        result["addedOrders"] = None if variant == "null" else []
+                    return result
+                self.venue.batch_result_transform = transform
+                self.venue.calls.clear()
+                self.exchange_logger.reset_mock()
+                result = self.exchange.create_orders("ETH", [{"side": "buy", "amount": "0.01", "price": "1999"}])
+                self.assertEqual(result["addedOrders"], [])
+                self.assertEqual(result["failedOrders"][0]["errorCode"], "insufficient_margin")
+                self.assertEqual([call.method for call in self.venue.calls], ["POST"])
+                self.exchange_logger.warning.assert_not_called()
+
+    def test_empty_optional_collections_still_confirm_every_unaccounted_order(self):
+        for added in ("empty", "missing", "null"):
+            for failed in ("empty", "missing", "null"):
+                with self.subTest(added=added, failed=failed):
+                    self.venue.batch_result_transform = lambda result: {
+                        field: None if variant == "null" else []
+                        for field, variant in (("addedOrders", added), ("failedOrders", failed))
+                        if variant != "missing"
+                    }
+                    self.venue.calls.clear()
+                    self.exchange_logger.reset_mock()
+                    result = self.exchange.create_orders("ETH", [
+                        {"side": "buy", "amount": "0.01", "price": "1999"},
+                        {"side": "sell", "amount": "0.01", "price": "2001"},
+                    ])
+                    self.assertEqual(len(result["addedOrders"]), 2)
+                    self.assertEqual(result["failedOrders"], [])
+                    self.assertEqual([call.method for call in self.venue.calls], ["POST", "GET", "GET"])
+                    self.exchange_logger.warning.assert_not_called()
+
+    def test_non_object_batch_result_is_diagnosed_and_confirmed(self):
+        for value in (None, [], False, "invalid"):
+            with self.subTest(value=value):
+                self.venue.batch_result_transform = lambda result: value
+                self.venue.calls.clear()
+                self.exchange_logger.reset_mock()
+                result = self.exchange.create_orders("ETH", [{"side": "buy", "amount": "0.01", "price": "1999"}])
+                self.assertEqual(len(result["addedOrders"]), 1)
+                self.assertEqual([call.method for call in self.venue.calls], ["POST", "GET"])
+                message = self.exchange_logger.warning.call_args_list[0].args[0]
+                self.assertIn("field=result", message)
+                self.assertIn(f"type={type(value).__name__}", message)
+
+    def test_non_array_collections_are_not_silently_treated_as_empty(self):
+        for field in ("addedOrders", "failedOrders"):
+            for value in ({}, {"unexpected": []}, "", "invalid", False, True, 0, 2.5):
+                with self.subTest(field=field, value=value):
+                    def transform(result):
+                        result[field] = value
+                        return result
+                    self.venue.batch_result_transform = transform
+                    self.venue.calls.clear()
+                    self.exchange_logger.reset_mock()
+                    result = self.exchange.create_orders("ETH", [{"side": "buy", "amount": "0.01", "price": "1999"}])
+                    self.assertEqual(len(result["addedOrders"]), 1)
+                    expected_methods = ["POST", "GET"] if field == "addedOrders" else ["POST"]
+                    self.assertEqual([call.method for call in self.venue.calls], expected_methods)
+                    message = self.exchange_logger.warning.call_args_list[0].args[0]
+                    self.assertIn(f"field={field}", message)
+                    self.assertIn(f"type={type(value).__name__}", message)
+
+    def test_invalid_success_item_only_confirms_affected_order(self):
+        for variant in ("invalid_price", "missing_client", "null", "string", "list"):
+            with self.subTest(variant=variant):
+                affected = []
+                def transform(result):
+                    raw = result["addedOrders"][0]
+                    affected.append(raw["clientOrderId"])
+                    if variant == "invalid_price":
+                        raw["price"] = "bad price"
+                    elif variant == "missing_client":
+                        raw.pop("clientOrderId")
+                    else:
+                        result["addedOrders"][0] = {"null": None, "string": "invalid", "list": []}[variant]
+                    return result
+                self.venue.batch_result_transform = transform
+                self.venue.calls.clear()
+                self.exchange_logger.reset_mock()
+                result = self.exchange.create_orders("ETH", [
+                    {"side": "buy", "amount": "0.01", "price": "1999"},
+                    {"side": "sell", "amount": "0.01", "price": "2001"},
+                ])
+                self.assertEqual(len(result["addedOrders"]), 2)
+                queries = [call for call in self.venue.calls if call.method == "GET"]
+                self.assertEqual(len(queries), 1)
+                self.assertTrue(queries[0].url.endswith("client:" + affected[0]))
+                message = self.exchange_logger.warning.call_args_list[0].args[0]
+                self.assertIn("field=addedOrders", message)
+                self.assertIn("added_count=2, failed_count=0", message)
+
+    def test_invalid_failure_item_preserves_other_success_and_failure(self):
+        self.venue.partial = True
+        def transform(result):
+            result["failedOrders"][0].pop("order")
+            return result
+        self.venue.batch_result_transform = transform
+        self.venue.calls.clear()
+        result = self.exchange.create_orders("ETH", [
+            {"side": "buy", "amount": "0.01", "price": str(price)} for price in (1999, 1998, 1997)
+        ])
+        self.assertEqual(len(result["addedOrders"]), 1)
+        self.assertEqual({item["errorCode"] for item in result["failedOrders"]}, {"insufficient_margin", "order_unconfirmed"})
+        submitted = json.loads(self.venue.calls[0].body)["orders"]
+        queries = [call for call in self.venue.calls if call.method == "GET"]
+        self.assertEqual(len(queries), 3)
+        self.assertTrue(all(call.url.endswith("client:" + submitted[1]["clientOrderId"]) for call in queries))
+
+    def test_repeated_client_result_confirms_only_that_client(self):
+        def transform(result):
+            result["addedOrders"].append(dict(result["addedOrders"][0]))
+            return result
+        self.venue.batch_result_transform = transform
+        self.venue.calls.clear()
+        result = self.exchange.create_orders("ETH", [
+            {"side": "buy", "amount": "0.01", "price": str(price)} for price in (1999, 1998)
+        ])
+        self.assertEqual(len(result["addedOrders"]), 2)
+        self.assertEqual([call.method for call in self.venue.calls], ["POST", "GET"])
+
+    def test_success_failure_conflict_queries_only_conflicting_client(self):
+        self.venue.partial = True
+        def transform(result):
+            result["failedOrders"].append({"order": dict(result["addedOrders"][0]), "errorCode": "conflict"})
+            return result
+        self.venue.batch_result_transform = transform
+        self.venue.calls.clear()
+        result = self.exchange.create_orders("ETH", [
+            {"side": "buy", "amount": "0.01", "price": str(price)} for price in (1999, 1998, 1997)
+        ])
+        self.assertEqual(len(result["addedOrders"]), 1)
+        self.assertEqual(len(result["failedOrders"]), 2)
+        self.assertTrue(all(item["errorCode"] == "insufficient_margin" for item in result["failedOrders"]))
+        self.assertEqual([call.method for call in self.venue.calls], ["POST", "GET"])
+
+    def test_shared_order_id_confirms_both_clients_preserving_unrelated_success(self):
+        def transform(result):
+            result["addedOrders"][0]["orderId"] = result["addedOrders"][1]["orderId"]
+            return result
+        self.venue.batch_result_transform = transform
+        self.venue.calls.clear()
+        result = self.exchange.create_orders("ETH", [
+            {"side": "buy", "amount": "0.01", "price": str(price)} for price in (1999, 1998, 1997)
+        ])
+        self.assertEqual(len({item["id"] for item in result["addedOrders"]}), 3)
+        self.assertEqual(result["failedOrders"], [])
+        self.assertEqual([call.method for call in self.venue.calls], ["POST", "GET", "GET"])
+
+    def test_null_failure_collection_during_grid_and_replacements(self):
+        def transform(result):
+            result["failedOrders"] = None
+            return result
+        self.venue.batch_result_transform = transform
+        self.placed()
+        self.venue.orders["1"].update(status="fullyfilled", filledSize="0.01")
+        self.trader.poller()
+        self.assertEqual(len(self.trader.All_orders), 60)
+        self.assertEqual(self.trader.pending_orders, [])
+        self.assertEqual(self.trader.counter, 1)
+        self.assertEqual(self.venue.post_count, 4)
+        self.assertFalse(any("client:" in call.url for call in self.venue.calls))
+        self.exchange_logger.warning.assert_not_called()
 
     def test_unconfirmed_orders_are_queued_with_confirmation_error_details(self):
         self.exchange._request = Mock(side_effect=[

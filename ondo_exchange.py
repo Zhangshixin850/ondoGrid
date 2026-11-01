@@ -364,39 +364,85 @@ class OndoExchange:
             response = {"result": {"addedOrders": [], "failedOrders": []}}
 
         added, failed = {}, {}
-        try:
-            result = response["result"]
-            if not isinstance(result["addedOrders"], list) or not isinstance(result["failedOrders"], list):
-                raise ValueError("Invalid Ondo batch response")
-            for raw in result["addedOrders"]:
-                client_id = raw["clientOrderId"]
-                request = requests[client_id]
-                order = self._parse_order(raw)
-                if (
-                    client_id in added or client_id in failed or order["symbol"] != market["symbol"]
-                    or order["side"] != request["side"]
-                    or Decimal(raw["size"]) != Decimal(request["size"])
-                    or Decimal(raw["price"]) != Decimal(request["price"])
-                    or order["status"] not in {"open", "pending", "filled", "canceled"}
-                    or order["id"] in {value["id"] for value in added.values()}
-                ):
-                    raise ValueError("Inconsistent Ondo batch order")
-                if order["status"] == "canceled":
-                    failed[client_id] = {
-                        "order": request, "errorCode": "order_canceled",
-                        "error": f'Canceled without fills: {raw.get("cancelReason") or "unspecified"}',
-                    }
-                else:
-                    added[client_id] = order
-            for item in result["failedOrders"]:
-                client_id = item["order"]["clientOrderId"]
-                if client_id not in requests or client_id in added or client_id in failed:
-                    raise ValueError("Inconsistent Ondo batch failure")
-                failed[client_id] = item
-        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-            # 格式异常时重新确认整批，不能依赖不完整的响应顺序或数量。
-            logger.warning(f"Ondo batch response invalid: {type(exc).__name__}: {exc}; confirming by clientOrderId")
-            added, failed = {}, {}
+        result = response.get("result")
+        if not isinstance(result, dict):
+            logger.warning(
+                f"Ondo batch response invalid: field=result, type={type(result).__name__}, "
+                f"request_count={len(requests)}; confirming unconfirmed orders by clientOrderId"
+            )
+            result = {}
+        collections = {}
+        for field in ("addedOrders", "failedOrders"):
+            items = result.get(field)
+            # 集合未提供或返回 null 时按空集合处理，其他类型不能悄悄忽略。
+            if items is None:
+                items = []
+            elif not isinstance(items, list):
+                logger.warning(
+                    f"Ondo batch response invalid: field={field}, type={type(items).__name__}, "
+                    f"request_count={len(requests)}; confirming unconfirmed orders by clientOrderId"
+                )
+                items = []
+            collections[field] = items
+
+        # 逐项处理；仅将格式异常或结果冲突的订单交给后续查询，保留其余有效结果。
+        invalid_clients, order_clients = set(), {}
+        for field, items in collections.items():
+            for index, item in enumerate(items):
+                client_id = None
+                try:
+                    if not isinstance(item, dict):
+                        raise ValueError("Expected an order result object")
+                    raw = item if field == "addedOrders" else item["order"]
+                    if not isinstance(raw, dict):
+                        raise ValueError("Expected order to be an object")
+                    client_id = raw.get("clientOrderId")
+                    if not isinstance(client_id, str) or client_id not in requests:
+                        raise ValueError("Missing or unexpected clientOrderId")
+                    if client_id in added or client_id in failed or client_id in invalid_clients:
+                        raise ValueError("Repeated or conflicting clientOrderId")
+                    request = requests[client_id]
+                    if field == "failedOrders":
+                        failed[client_id] = item
+                        continue
+                    order = self._parse_order(raw)
+                    other_client = order_clients.get(order["id"])
+                    if other_client is not None and other_client != client_id:
+                        invalid_clients.add(other_client)
+                        added.pop(other_client, None)
+                        failed.pop(other_client, None)
+                        logger.warning(
+                            f"Ondo batch order ID conflict: client_ids={other_client},{client_id}; "
+                            "confirming both orders by clientOrderId"
+                        )
+                        raise ValueError("Order ID is shared by multiple clientOrderIds")
+                    order_clients[order["id"]] = client_id
+                    if (
+                        order["symbol"] != market["symbol"] or order["side"] != request["side"]
+                        or Decimal(raw["size"]) != Decimal(request["size"])
+                        or Decimal(raw["price"]) != Decimal(request["price"])
+                        or order["status"] not in {"open", "pending", "filled", "canceled"}
+                    ):
+                        raise ValueError("Batch order did not match the requested order")
+                    if order["status"] == "canceled":
+                        failed[client_id] = {
+                            "order": request, "errorCode": "order_canceled",
+                            "error": f'Canceled without fills: {raw.get("cancelReason") or "unspecified"}',
+                        }
+                    else:
+                        added[client_id] = order
+                except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+                    known_client = isinstance(client_id, str) and client_id in requests
+                    if known_client:
+                        invalid_clients.add(client_id)
+                        added.pop(client_id, None)
+                        failed.pop(client_id, None)
+                    logger.warning(
+                        f"Ondo batch item invalid: field={field}, index={index}, "
+                        f"type={type(item).__name__}, client_id={client_id if known_client else 'unknown'}, "
+                        f"added_count={len(collections['addedOrders'])}, failed_count={len(collections['failedOrders'])}: "
+                        f"{type(exc).__name__}: {exc}; confirming unconfirmed orders by clientOrderId"
+                    )
 
         for client_id, request in requests.items():
             if client_id in added or client_id in failed:
