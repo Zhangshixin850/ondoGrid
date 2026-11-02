@@ -242,10 +242,15 @@ class OndoExchange:
 
     def fetch_ticker(self, symbol):
         market = self.market(symbol)
-        response = self._request("GET", "/v1/perps/mark_prices", private=False)
-        detail = response["result"][market["id"]]
+        detail = self.fetch_mark_prices()[market["id"]]
         mark = float(detail.get("markPrice") or detail.get("price") or 0)
         return {"mark": mark, "last": None, "close": mark}
+
+    def fetch_mark_prices(self):
+        return self._request("GET", "/v1/perps/mark_prices", private=False)["result"]
+
+    def fetch_balance(self):
+        return self._request("GET", "/v1/perps/balance")["result"]
 
     def fetch_positions(self, symbols=None):
         if not self._markets:
@@ -308,16 +313,18 @@ class OndoExchange:
             "info": order,
         }
 
-    def fetch_open_orders(self, symbol):
-        market = self.market(symbol)
-        params = {"market": market["id"], "status": "open", "limit": 1000}
+    def fetch_open_orders(self, symbol=None):
+        market = self.market(symbol) if symbol is not None else None
+        params = {"status": "open", "limit": 1000}
+        if market is not None:
+            params["market"] = market["id"]
         orders, cursors = {}, set()
         while True:
             page = self._request("GET", "/v1/perps/orders", params=params)
             if not isinstance(page["result"], list):
                 raise ValueError("Invalid Ondo open orders response")
             for raw in page["result"]:
-                if raw["market"] != market["id"]:
+                if market is not None and raw["market"] != market["id"]:
                     raise ValueError("Ondo returned orders for another market")
                 if raw["status"] in {"open", "pending", "untriggered"}:
                     order = self._parse_order(raw)
@@ -336,11 +343,11 @@ class OndoExchange:
             return {"addedOrders": [], "failedOrders": []}
         if len(orders) > 20:
             raise ValueError("Ondo batch placement supports at most 20 orders")
-        market = self.market(symbol)
         requests = {}
         for item in orders:
-            amount = self.amount_to_precision(symbol, item["amount"])
-            price = self.price_to_precision(symbol, item["price"])
+            market = self.market(item["symbol"] if symbol is None else symbol)
+            amount = self.amount_to_precision(market["symbol"], item["amount"])
+            price = self.price_to_precision(market["symbol"], item["price"])
             if item["side"] not in {"buy", "sell"} or min(Decimal(amount), Decimal(price)) <= 0:
                 raise ValueError("Ondo orders require a valid side, positive amount and price")
             client_id = item.get("clientOrderId") or "grid_" + uuid.uuid4().hex
@@ -418,7 +425,7 @@ class OndoExchange:
                         raise ValueError("Order ID is shared by multiple clientOrderIds")
                     order_clients[order["id"]] = client_id
                     if (
-                        order["symbol"] != market["symbol"] or order["side"] != request["side"]
+                        order["symbol"] != self.market(request["market"])["symbol"] or order["side"] != request["side"]
                         or Decimal(raw["size"]) != Decimal(request["size"])
                         or Decimal(raw["price"]) != Decimal(request["price"])
                         or order["status"] not in {"open", "pending", "filled", "canceled"}
@@ -457,7 +464,7 @@ class OndoExchange:
                     order = self._parse_order(raw)
                     if (
                         order["clientOrderId"] == client_id
-                        and order["symbol"] == market["symbol"]
+                        and order["symbol"] == self.market(request["market"])["symbol"]
                         and order["side"] == request["side"]
                         and Decimal(raw["size"]) == Decimal(request["size"])
                         and Decimal(raw["price"]) == Decimal(request["price"])
@@ -484,20 +491,26 @@ class OndoExchange:
         return {"addedOrders": list(added.values()), "failedOrders": list(failed.values())}
 
     def cancel_orders(self, symbol, order_ids):
-        """批量撤单，并核实未明确成功项是否已成交或已撤销。"""
-        order_ids = list(dict.fromkeys(str(value) for value in order_ids))
+        """symbol=None 时接收含 id/symbol 的订单，支持跨市场撤单。"""
+        expected = {}
+        for item in order_ids:
+            order_id = str(item["id"] if isinstance(item, dict) else item)
+            market = self.market(item["symbol"] if symbol is None else symbol)
+            if order_id in expected and expected[order_id] != market["id"]:
+                raise ValueError("Conflicting cancellation markets")
+            expected[order_id] = market["id"]
+        order_ids = list(expected)
         if not order_ids:
             return
         if len(order_ids) > 20:
             raise ValueError("Use at most 20 cancellations per batch")
-        market = self.market(symbol)
         response = self._request(
             "DELETE", "/v1/perps/orders/batch", params={"orderIDs": ",".join(order_ids)}
         )
         result = response.get("result") or {}
         confirmed = set()
         for order in result.get("successfulCancels", []):
-            if order.get("market") == market["id"] and order.get("status") == "canceled":
+            if order.get("market") == expected.get(str(order.get("orderId"))) and order.get("status") == "canceled":
                 confirmed.add(str(order["orderId"]))
         failures = {
             str(item["orderId"]): item for item in result.get("failedCancels", [])
@@ -509,7 +522,7 @@ class OndoExchange:
             response = self._request("GET", f"/v1/perps/orders/{order_id}")
             order = response["result"]
             if (
-                str(order["orderId"]) == order_id and order["market"] == market["id"]
+                str(order["orderId"]) == order_id and order["market"] == expected[order_id]
                 and order["status"] in {"canceled", "fullyfilled"}
             ):
                 continue

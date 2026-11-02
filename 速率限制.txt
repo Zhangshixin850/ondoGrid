@@ -1,0 +1,10 @@
+目前 Perps API 默认速率限制 是按账户计算的：
+下单（order placement）
+• 持续：2 请求/秒
+• 突发：最多 50 个
+撤单（order cancellation）
+• 持续：2 请求/秒
+• 突发：最多 50 个
+下单和撤单是 两个独立的限制，互不占用。
+如果你使用批量接口（例如 POST /v1/perps/orders/batch 或 DELETE /v1/perps/orders/batch），整个批量请求只算一次 API 调用，因此高频策略建议使用批量提交或撤单，可以显著降低请求数量。
+如果超过限制，API 会返回 HTTP 429 错误。
