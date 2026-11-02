@@ -742,6 +742,23 @@ class GridTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.account.accountInfo([{"symbol": self.grid.symbol}] * 65)
 
+    def test_three_open_orders_continue_but_two_stop_between_account_checks(self):
+        self.grid.switc = False
+        self.account.myloop = 1
+        self.exchange.create_orders("ETH", [
+            {"side": "buy", "amount": "0.01", "price": price} for price in (1997, 1998, 1999)
+        ])
+        self.run_loops(1)
+        orders = self.exchange.fetch_open_orders()
+        self.assertEqual(len(orders), 3)
+        self.assertEqual(self.account.myloop, 2)
+        self.assertFalse(any("perps/balance" in c.url for c in self.venue.calls))
+        self.exchange.cancel_orders("ETH", [orders[0]["id"]])
+        with self.assertRaises(SystemExit) as stopped:
+            self.account.run()
+        self.assertEqual(stopped.exception.code, 1)
+        self.assertEqual(self.exchange.fetch_open_orders(), [])
+
     def test_single_market_risk_stops_all_and_too_few_resumes_after_queue_drains(self):
         self.enable_three()
         self.placed()

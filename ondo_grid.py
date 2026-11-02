@@ -293,7 +293,7 @@ class AccountTrader:
                     self.display(orders)
                 for symbol, grid in self.grids.items():
                     count = sum(order["symbol"] == symbol for order in orders)
-                    if not grid.switc and not grid.pending_orders and count < grid.gridLines // 3:
+                    if not grid.switc and not grid.pending_orders and count < 3:
                         self.critical(f"{symbol} 挂单过少，停止全部网格", exit_after=True)
                 self.rebuild_grids(orders)
                 for symbol, grid in self.grids.items():
