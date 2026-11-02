@@ -109,12 +109,15 @@ class AccountTrader:
         self.exchange = exchange
         self.name = os.getenv("NAME", "")
         self.check_interval = float(os.getenv("CHECK_INTERVAL", "0.8"))
+        self.inter_patch = float(os.getenv("interPatch", "0.2"))
         self.mmr_limit = float(os.getenv("MMR", "0.2"))
         self.leverage_limit = float(os.getenv("leverage", "5"))
         self.critical_error_limit = int(os.getenv("CRITICAL_ERROR_LIMIT", "3"))
         if any(not math.isfinite(v) or v <= 0 for v in
                (self.check_interval, self.mmr_limit, self.leverage_limit)) or self.critical_error_limit <= 0:
             raise ValueError("Invalid account limits or polling configuration")
+        if not math.isfinite(self.inter_patch) or self.inter_patch < 0:
+            raise ValueError("interPatch must be a finite non-negative number")
         self.cancel_on_exit = os.getenv("CANCEL_ON_EXIT", "true").strip().lower() == "true"
         self.cancel_on_risk = os.getenv("CANCEL_ON_RISK", "true").strip().lower() == "true"
         self.notify_webhook = os.getenv("NOTIFY_WEBHOOK", "").strip().strip("'\"")
@@ -162,7 +165,7 @@ class AccountTrader:
             except Exception as exc:
                 errors.append(str(exc))
             if len(batch) == 20 and offset + 20 < len(selected):
-                time.sleep(0.4)
+                time.sleep(self.inter_patch)
         if selected:
             remaining = [order for order in self.exchange.fetch_open_orders() if order["symbol"] in symbols]
             if remaining or errors:
@@ -268,7 +271,7 @@ class AccountTrader:
                 logger.warning(f"Ondo batch placement failed: {exc}",
                                extra={"console_message": f"批量下单失败 {len(batch)} 单，留待下轮重试"})
             if len(batch) == 20 and offset + 20 < len(pending):
-                time.sleep(0.4)
+                time.sleep(self.inter_patch)
 
     def display(self, orders):
         rows = ["币种          参考价      仓位      目标差额     浮盈亏    买/卖挂单  待处理  成交"]

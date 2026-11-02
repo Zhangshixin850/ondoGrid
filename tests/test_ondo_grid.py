@@ -470,7 +470,8 @@ class GridTests(unittest.TestCase):
         for key, value in (("gridLines1", "3"), ("gridStep1", "0.05"),
                            ("orderSize1", "0.0001"), ("maxposi1", "0"),
                            ("lowLimit1", "inf"), ("MAX_LOSS1", "nan"),
-                           ("MMR", "0"), ("leverage", "nan"), ("CHECK_INTERVAL", "0")):
+                           ("MMR", "0"), ("leverage", "nan"), ("CHECK_INTERVAL", "0"),
+                           ("interPatch", "-0.1"), ("interPatch", "nan"), ("interPatch", "inf")):
             with self.subTest(key=key), patch.dict(os.environ, {key: value}):
                 with self.assertRaises((ValueError, KeyError)):
                     AccountTrader(self.exchange)
@@ -541,23 +542,28 @@ class GridTests(unittest.TestCase):
         self.assertTrue(all(g.myNewPrice == 2000 for g in self.account.grids.values()))
 
     def test_batch_spacing_for_placement_and_cancellation(self):
-        for total, waits in ((20, 0), (40, 1), (41, 2), (60, 2)):
-            with self.subTest(total=total):
-                self.venue.orders.clear()
-                self.grid.All_orders.clear()
-                self.grid.switc = False
-                self.grid.pending_orders = [
-                    {"symbol": self.grid.symbol, "side": "buy", "amount": "0.01",
-                     "price": 1900 + i, "edge": 0} for i in range(total)
-                ]
-                self.sleep_mock.reset_mock()
-                self.account.submit_orders()
-                self.assertEqual(self.sleep_mock.call_args_list, [call(0.4)] * waits)
-                self.assertEqual(len(self.grid.All_orders), total)
-                self.sleep_mock.reset_mock()
-                self.account.cancel_open_orders("spacing")
-                self.assertEqual(self.sleep_mock.call_args_list, [call(0.4)] * waits)
-                self.assertEqual(self.exchange.fetch_open_orders(), [])
+        self.assertEqual(self.account.inter_patch, 0.2)
+        for interval in (0.2, 0.35, 0):
+            with patch.dict(os.environ, {"interPatch": str(interval)}):
+                self.account = AccountTrader(self.exchange)
+                self.grid = self.account.grids["ETH-USD.P"]
+            for total, waits in ((20, 0), (40, 1), (41, 2), (60, 2)):
+                with self.subTest(interval=interval, total=total):
+                    self.venue.orders.clear()
+                    self.grid.All_orders.clear()
+                    self.grid.switc = False
+                    self.grid.pending_orders = [
+                        {"symbol": self.grid.symbol, "side": "buy", "amount": "0.01",
+                         "price": 1900 + i, "edge": 0} for i in range(total)
+                    ]
+                    self.sleep_mock.reset_mock()
+                    self.account.submit_orders()
+                    self.assertEqual(self.sleep_mock.call_args_list, [call(interval)] * waits)
+                    self.assertEqual(len(self.grid.All_orders), total)
+                    self.sleep_mock.reset_mock()
+                    self.account.cancel_open_orders("spacing")
+                    self.assertEqual(self.sleep_mock.call_args_list, [call(interval)] * waits)
+                    self.assertEqual(self.exchange.fetch_open_orders(), [])
 
     def test_mixed_markets_precision_and_confirmation(self):
         self.exchange._markets["BTC-USD.P"]["precision"] = {"amount": "0.01", "price": "1"}
@@ -817,6 +823,7 @@ class GridTests(unittest.TestCase):
         example = dotenv_values(root / ".env.example")
         self.assertEqual(example["ONDO_API_KEY_ID"], "")
         self.assertEqual(example["ONDO_API_SECRET"], "")
+        self.assertEqual(example["interPatch"], "0.2")
         self.assertEqual((example["SYMBOL2"], example["SYMBOL3"]), ("", ""))
         with patch.dict(os.environ, {k: v for k, v in example.items() if v is not None}, clear=True):
             self.assertEqual(len(AccountTrader(self.exchange).grids), 1)
