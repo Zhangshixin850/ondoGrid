@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Ondo v3.0 多币种中性网格；Ubuntu Python 3.10+，通过 .env 配置。"""
+"""Ondo v3.1 多币种中性网格；Ubuntu Python 3.10+，通过 .env 配置。"""
 
 import json
 import logging
@@ -10,6 +10,7 @@ import sys
 import time
 import urllib.request
 import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from itertools import zip_longest
 
@@ -62,6 +63,9 @@ class GridTrader:
         self.last_fill_price = 0.0
         self.position = 0.0
         self.pnl = 0.0
+        self.order_stats = {}
+        self.stats = {key: Decimal(0) for key in ("volume", "fees", "profit")}
+        self.stats.update(makers=0, takers=0)
 
     def place_grid_orders(self):
         # 先验证整张网格；撤单成功后才替换本地状态。
@@ -96,11 +100,13 @@ class GridTrader:
             if order_id in queued:
                 continue
             _, old_price, old_side = self.All_orders[order_id]
+            source = self.order_stats.get(order_id)
             self.pending_orders.append({
                 "symbol": self.symbol, "amount": self.amount, "edge": 0,
                 "side": "sell" if old_side == "buy" else "buy",
                 "price": old_price + self.gridStep if old_side == "buy" else old_price - self.gridStep,
                 "old_id": order_id, "old_price": old_price,
+                "stats_pair": source["pair"] if source and source["entry"] else None,
             })
 
 
@@ -137,6 +143,11 @@ class AccountTrader:
         self.myloop = 0
         self.critical_errors = 0
         self.balance = {}
+        self.stats_started = int(time.time() * 1000)
+        self.stats_until = self.stats_started
+        self.stats_clients = {}
+        self.stats_fills = {}
+        self.stats_stale = False
 
     def notify(self, message):
         if not self.notify_webhook:
@@ -243,7 +254,15 @@ class AccountTrader:
         for offset in range(0, len(pending), 20):
             batch = pending[offset:offset + 20]
             for item in batch:
+                if not item.get("stats_pair"):
+                    item["stats_pair"] = uuid.uuid4().hex
+                    item["stats_entry"] = True
                 item["clientOrderId"] = "grid_" + uuid.uuid4().hex
+                # 不确定的提交也保留客户端 ID；重试沿用同一配对组。
+                self.stats_clients[item["clientOrderId"]] = {
+                    "symbol": item["symbol"], "side": item["side"],
+                    "pair": item["stats_pair"], "entry": item.get("stats_entry", False),
+                }
             try:
                 result = self.exchange.create_orders(None, batch)
                 added = {order["clientOrderId"]: order for order in result["addedOrders"]}
@@ -253,6 +272,7 @@ class AccountTrader:
                     if order is None:
                         continue
                     grid = self.grids[item["symbol"]]
+                    grid.order_stats[order["id"]] = self.stats_clients[item["clientOrderId"]]
                     grid.All_orders[order["id"]] = [item["edge"], order["price"], order["side"]]
                     if "old_id" in item:
                         del grid.All_orders[item["old_id"]]
@@ -273,26 +293,118 @@ class AccountTrader:
             if len(batch) == 20 and offset + 20 < len(pending):
                 time.sleep(self.inter_patch)
 
+    def refresh_stats(self):
+        try:
+            end_time = int(time.time() * 1000)
+            start_time = max(self.stats_started, self.stats_until - 60000)
+            fills = dict(self.stats_fills)
+            learned_orders = {}
+            for raw in self.exchange.fetch_fills(start_time, end_time):
+                if not isinstance(raw, dict):
+                    raise ValueError("Invalid fill record")
+                symbol = raw.get("market")
+                if symbol not in self.grids:
+                    continue
+                order_id = raw.get("orderId")
+                known = self.grids[symbol].order_stats.get(order_id)
+                client = self.stats_clients.get(raw.get("clientOrderId"))
+                source = known or client
+                if source is None:
+                    continue
+                if (known and client and known != client) or source["symbol"] != symbol:
+                    raise ValueError("Conflicting fill ownership")
+                fill_id = raw["id"]
+                stamp = datetime.fromisoformat(raw["time"].replace("Z", "+00:00"))
+                size, price, cost, fee, rebate = (Decimal(str(raw.get(key, "0"))) for key in
+                                                ("size", "price", "filledCost", "fee", "feeRebate"))
+                if (not isinstance(fill_id, str) or not fill_id or not isinstance(order_id, str)
+                        or not order_id or stamp.utcoffset() is None
+                        or not all(v.is_finite() for v in (size, price, cost, fee, rebate))
+                        or min(size, price, cost) <= 0 or "fee" not in raw
+                        or type(raw.get("isMaker")) is not bool or raw.get("side") != source["side"]):
+                    raise ValueError("Invalid owned fill")
+                timestamp = (stamp - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(milliseconds=1)
+                if not self.stats_started <= timestamp <= end_time:
+                    raise ValueError("Owned fill outside this run's time range")
+                fill = dict(source, order_id=order_id, time=timestamp, size=size, price=price,
+                            cost=cost, fee=fee - rebate, maker=raw["isMaker"])
+                if fill_id in fills and fills[fill_id] != fill:
+                    raise ValueError("Conflicting duplicate fill")
+                fills[fill_id] = fill
+                key = (symbol, order_id)
+                if key in learned_orders and learned_orders[key] != source:
+                    raise ValueError("Order shared by different grid pairs")
+                learned_orders[key] = source
+
+            totals = {symbol: {"volume": Decimal(0), "fees": Decimal(0), "profit": Decimal(0),
+                               "makers": set(), "takers": set()} for symbol in self.grids}
+            pairs = {}
+            # 重算本次运行的成交账本，使重叠窗口、迟到成交及部分成交顺序无关。
+            for fill_id, fill in sorted(fills.items(), key=lambda item: (item[1]["time"], item[0])):
+                total = totals[fill["symbol"]]
+                total["volume"] += fill["cost"]
+                total["fees"] += fill["fee"]
+                total["profit"] -= fill["fee"]
+                total["makers" if fill["maker"] else "takers"].add(fill["order_id"])
+                pair = pairs.setdefault((fill["symbol"], fill["pair"]), {"entries": [], "exits": []})
+                pair["entries" if fill["entry"] else "exits"].append(fill)
+            for (symbol, _), pair in pairs.items():
+                entries = [[fill["size"], fill["cost"] / fill["size"], fill["side"]]
+                           for fill in pair["entries"]]
+                index = 0
+                for closing in pair["exits"]:
+                    remaining = closing["size"]
+                    closing_price = closing["cost"] / closing["size"]
+                    while remaining > 0 and index < len(entries):
+                        entry = entries[index]
+                        if entry[2] == closing["side"]:
+                            raise ValueError("Grid pair must have opposite sides")
+                        matched = min(entry[0], remaining)
+                        spread = closing_price - entry[1] if entry[2] == "buy" else entry[1] - closing_price
+                        totals[symbol]["profit"] += spread * matched
+                        remaining -= matched
+                        entry[0] -= matched
+                        if entry[0] == 0:
+                            index += 1
+            for symbol, total in totals.items():
+                total["makers"], total["takers"] = len(total["makers"]), len(total["takers"])
+                self.grids[symbol].stats = total
+            for (symbol, order_id), source in learned_orders.items():
+                self.grids[symbol].order_stats[order_id] = source
+            self.stats_fills = fills
+            self.stats_until = end_time
+            self.stats_stale = False
+        except Exception as exc:
+            self.stats_stale = True
+            logger.warning(f"Fill statistics refresh failed: {type(exc).__name__}: {exc}",
+                           extra={"console_message": "成交统计滞后，沿用上次完整统计，下一次定期刷新重试"})
+
     def display(self, orders):
-        rows = ["币种          参考价      仓位      目标差额     浮盈亏    买/卖挂单  待处理  成交"]
+        rows = ["币种          参考价      仓位      目标差额     浮盈亏    买/卖挂单  待处理  成交"
+                "    交易量(U)  Maker单  Taker单  累计手续费(U)   网格净利(U)"]
         for symbol, grid in self.grids.items():
             target = (grid.baseline - (grid.last_fill_price or grid.myNewPrice)) * grid.orderSize / grid.gridStep + grid.left
             buys = sum(order["symbol"] == symbol and order["side"] == "buy" for order in orders)
             sells = sum(order["symbol"] == symbol and order["side"] == "sell" for order in orders)
             rows.append(f"{symbol:<12} {grid.myNewPrice:>9g} {grid.position:>9g} {grid.position - target:>11.5g} "
-                        f"{grid.pnl:>10.2f} {buys:>4}/{sells:<4} {len(grid.pending_orders):>5} {grid.counter:>6}")
-        logger.info("快照（仓位/浮盈亏每20轮刷新；差额负值买、正值卖）\n" + "\n".join(rows))
+                        f"{grid.pnl:>10.2f} {buys:>4}/{sells:<4} {len(grid.pending_orders):>5} {grid.counter:>6}"
+                        f" {grid.stats['volume']:>12.2f} {grid.stats['makers']:>8} {grid.stats['takers']:>8}"
+                        f" {grid.stats['fees']:>14.4f} {grid.stats['profit']:>14.4f}")
+        status = "；统计滞后" if self.stats_stale else ""
+        logger.info("快照（每50轮刷新；差额负值买、正值卖；本次运行统计，U按USDC记账" + status + "）\n"
+                    + "\n".join(rows) + "\nMaker/Taker按角色订单去重，混合成交订单两列各计一次；网格净利已扣全部交易净手续费。")
 
     def run(self):
-        logger.info(f"Ondo v3.0 | {self.name} | {', '.join(self.grids)} | 轮询 {self.check_interval:g}s")
-        self.notify(f"{self.name} v3.0 started: {', '.join(self.grids)}")
+        logger.info(f"Ondo v3.1 | {self.name} | {', '.join(self.grids)} | 轮询 {self.check_interval:g}s")
+        self.notify(f"{self.name} v3.1 started: {', '.join(self.grids)}")
         while True:
             try:
                 orders = self.exchange.fetch_open_orders()
                 if not isinstance(orders, list):
                     raise RuntimeError("Missing account open orders snapshot")
-                if self.myloop % 20 == 0:
+                if self.myloop % 50 == 0:
                     self.accountInfo(orders)
+                    self.refresh_stats()
                     self.display(orders)
                 for symbol, grid in self.grids.items():
                     count = sum(order["symbol"] == symbol for order in orders)

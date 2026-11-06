@@ -337,6 +337,26 @@ class OndoExchange:
             cursors.add(cursor)
             params["cursor"] = cursor
 
+    def fetch_fills(self, start_time, end_time):
+        """共享查询指定时间窗内的全部成交；分页完成后才返回。"""
+        params = {"startTime": start_time, "endTime": end_time, "limit": 1000}
+        fills, cursors = [], set()
+        while True:
+            page = self._request("GET", "/v1/perps/fills", params=params)
+            if not isinstance(page.get("result"), list):
+                raise ValueError("Invalid Ondo fills response")
+            fills.extend(page["result"])
+            page_info = page.get("pageInfo") or {}
+            if not isinstance(page_info, dict):
+                raise ValueError("Invalid Ondo fills pagination")
+            cursor = page_info.get("nextCursor")
+            if not cursor:
+                return fills
+            if not isinstance(cursor, str) or cursor in cursors:
+                raise ValueError("Invalid or repeated Ondo fills cursor")
+            cursors.add(cursor)
+            params["cursor"] = cursor
+
     def create_orders(self, symbol, orders):
         """提交一批最多 20 笔普通 GTC 单，返回成功项及明确失败/无法确认项。"""
         if not orders:

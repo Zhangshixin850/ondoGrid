@@ -11,6 +11,8 @@ import runpy
 import socket
 import sys
 import unittest
+from datetime import datetime, timezone
+from decimal import Decimal
 from unittest.mock import Mock, patch, call
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -42,6 +44,9 @@ class Venue:
         self.empty_book = False
         self.position = 0
         self.pnl = 0
+        self.fills = []
+        self.fill_page_size = 0
+        self.fail_fill_page = None
         self.markets = [{
             "market": "ETH-USD.P", "baseIncrement": "0.001", "quoteIncrement": "0.1",
             "pair": {"base": "ETH", "quote": "USD"},
@@ -121,6 +126,18 @@ class Venue:
                     order["status"] = "canceled"
                     successful.append(dict(order))
             result = {"successfulCancels": successful, "failedCancels": failed}
+        elif path == "/v1/perps/fills":
+            start, end = int(query["startTime"][0]), int(query["endTime"][0])
+            result = [dict(fill) for fill in self.fills
+                      if start <= round(datetime.fromisoformat(fill["time"]).timestamp() * 1000) <= end]
+            result.reverse()
+            if self.fill_page_size:
+                start = int(query.get("cursor", ["0"])[0])
+                if start == self.fail_fill_page:
+                    raise requests.Timeout("fills page failed")
+                end = start + self.fill_page_size
+                if end < len(result): page_info = {"nextCursor": str(end)}
+                result = result[start:end]
         elif path == "/v1/perps/orders":
             result = [dict(order) for order in self.orders.values() if order["status"] == "open"
                       and ("market" not in query or order["market"] == query["market"][0])]
@@ -526,11 +543,14 @@ class GridTests(unittest.TestCase):
                     self.account.accountInfo([])
         self.assertEqual(self.venue.post_count, 0)
 
-    def test_account_checks_every_twenty_loops(self):
-        self.run_loops(41)
-        for path in ("/v1/perps/balance", "/v1/perps/positions"):
+    def test_account_and_fills_checks_every_fifty_loops(self):
+        self.run_loops(101)
+        for path in ("/v1/perps/balance", "/v1/perps/positions", "/v1/perps/fills"):
             self.assertEqual(sum(urlsplit(c.url).path == path for c in self.venue.calls), 3)
-        self.assertEqual(self.account.myloop, 41)
+        self.assertEqual(self.account.myloop, 101)
+        self.assertEqual(sum(urlsplit(c.url).path == "/v1/perps/orders" for c in self.venue.calls), 101)
+        tables = [c for c in self.logger.info.call_args_list if "交易量(U)" in c.args[0]]
+        self.assertEqual(len(tables), 3)
 
     def test_price_fallback_shared_and_midpoint_preferred(self):
         self.enable_three()
@@ -715,7 +735,7 @@ class GridTests(unittest.TestCase):
 
     def test_all_placement_failures_do_not_skip_account_risk(self):
         self.venue.reject_all = True
-        self.run_loops(21)
+        self.run_loops(51)
         self.assertEqual(len(self.grid.pending_orders), 60)
         self.assertEqual(self.account.critical_errors, 0)
         self.assertEqual(sum("perps/balance" in c.url for c in self.venue.calls), 2)
@@ -817,6 +837,209 @@ class GridTests(unittest.TestCase):
         self.assertTrue(self.exchange._closed)
         for name in ("ondo_exchange", "__main__"):
             logging.getLogger(name).handlers.clear()
+
+    def record_fill(self, order_id, size="0.01", price=None, fee="0", maker=True, rebate="0", offset=1000):
+        order = self.venue.orders[order_id]
+        size, price = Decimal(size), Decimal(str(price if price is not None else order["price"]))
+        fill = {"id": f"fill-{len(self.venue.fills) + 1}", "orderId": order_id,
+                "clientOrderId": order["clientOrderId"], "market": order["market"], "side": order["side"],
+                "price": str(price), "size": str(size), "filledCost": str(size * price),
+                "fee": fee, "feeRebate": rebate, "isMaker": maker,
+                "time": datetime.fromtimestamp((self.account.stats_started + offset) / 1000, timezone.utc).isoformat()}
+        self.venue.fills.append(fill)
+        order["filledSize"] = str(Decimal(order["filledSize"]) + size)
+        if Decimal(order["filledSize"]) == Decimal(order["size"]):
+            order["status"] = "fullyfilled"
+        return fill
+
+    def refresh_stats_at(self, offset=10000):
+        with patch("ondo_grid.time.time", return_value=(self.account.stats_started + offset) / 1000):
+            self.account.refresh_stats()
+        self.assertFalse(self.account.stats_stale)
+
+    def replace_filled(self):
+        before = set(self.grid.All_orders)
+        self.grid.poller(self.exchange.fetch_open_orders())
+        self.account.submit_orders()
+        created = set(self.grid.All_orders) - before
+        self.assertEqual(len(created), 1)
+        return created.pop()
+
+    def test_stats_partial_mixed_roles_and_signed_fees(self):
+        self.placed()
+        oid = next(oid for oid, state in self.grid.All_orders.items() if not state[0] and state[2] == "buy")
+        self.record_fill(oid, "0.004", "1999", fee="0.001", maker=False)
+        self.record_fill(oid, "0.003", "1999", fee="-0.0002", rebate="0.0001")
+        self.record_fill(oid, "0.003", "1999", fee="0.001")
+        self.refresh_stats_at()
+        self.assertEqual(self.grid.stats, dict(volume=Decimal("19.990"), fees=Decimal("0.0017"),
+                                              profit=Decimal("-0.0017"), makers=1, takers=1))
+        self.refresh_stats_at(20000)
+        self.assertEqual(self.grid.stats["volume"], Decimal("19.990"))
+        self.assertEqual(len(self.account.stats_fills), 3)
+
+    def test_stats_round_trips_use_actual_prices_without_reusing_close(self):
+        self.placed()
+        entry = next(oid for oid, state in self.grid.All_orders.items() if not state[0] and state[2] == "buy")
+        self.record_fill(entry, price="1998.8", fee="0.002")
+        close = self.replace_filled()
+        self.record_fill(close, "0.004", "2000.2", fee="0.001", maker=False, offset=2000)
+        self.refresh_stats_at()
+        self.assertEqual(self.grid.stats["profit"], Decimal("0.0026"))
+        self.record_fill(close, "0.006", "2000.2", fee="0.001", offset=3000)
+        next_entry = self.replace_filled()
+        self.record_fill(next_entry, price="1999", fee="0.002", offset=4000)
+        self.refresh_stats_at(20000)
+        self.assertEqual(self.grid.stats["profit"], Decimal("0.008"))
+        next_close = self.replace_filled()
+        self.record_fill(next_close, price="2000", fee="0.002", offset=5000)
+        self.refresh_stats_at(30000)
+        self.assertEqual(self.grid.stats["profit"], Decimal("0.016"))
+        self.assertEqual(self.grid.stats["volume"], Decimal("79.980"))
+        self.assertEqual((self.grid.stats["makers"], self.grid.stats["takers"]), (4, 1))
+
+    def test_stats_short_first_and_late_entry_are_order_independent(self):
+        self.placed()
+        entry = next(oid for oid, state in self.grid.All_orders.items() if not state[0] and state[2] == "sell")
+        opening_fill = self.record_fill(entry, price="2001", fee="0.001")
+        close = self.replace_filled()
+        self.record_fill(close, price="2000", fee="0.001", offset=2000)
+        self.venue.fills.remove(opening_fill)
+        self.refresh_stats_at()
+        self.assertEqual(self.grid.stats["profit"], Decimal("-0.001"))
+        self.venue.fills.append(opening_fill)
+        self.refresh_stats_at(20000)
+        self.assertEqual(self.grid.stats["profit"], Decimal("0.008"))
+
+    def test_stats_rebuild_keeps_totals_but_never_matches_old_inventory(self):
+        self.placed()
+        entry = next(oid for oid, state in self.grid.All_orders.items() if not state[0] and state[2] == "buy")
+        self.record_fill(entry, price="1999", fee="0.001")
+        self.refresh_stats_at()
+        self.grid.switc = True
+        self.grid.myNewPrice = 2100
+        self.account.rebuild_grids(self.exchange.fetch_open_orders())
+        self.account.submit_orders()
+        new_sell = next(oid for oid, state in self.grid.All_orders.items() if not state[0] and state[2] == "sell")
+        self.record_fill(new_sell, price="2101", fee="0.001", offset=2000)
+        self.refresh_stats_at(20000)
+        self.assertEqual(self.grid.stats["profit"], Decimal("-0.002"))
+        self.assertEqual(self.grid.stats["volume"], Decimal("41.00"))
+        self.assertIn(entry, self.grid.order_stats)
+
+    def test_stats_account_shared_pagination_and_ignores_manual_fills(self):
+        self.enable_three()
+        self.placed()
+        for grid in self.account.grids.values():
+            self.record_fill(next(iter(grid.All_orders)))
+        manual = dict(self.venue.fills[0], id="manual", orderId="manual", clientOrderId="manual")
+        self.venue.fills.extend([manual, dict(self.venue.fills[0])])
+        self.venue.fill_page_size = 2
+        self.venue.calls.clear()
+        self.refresh_stats_at()
+        self.assertEqual(len(self.account.stats_fills), 3)
+        self.assertTrue(all(grid.stats["makers"] == 1 for grid in self.account.grids.values()))
+        reads = [c for c in self.venue.calls if urlsplit(c.url).path == "/v1/perps/fills"]
+        self.assertEqual(len(reads), 3)
+        self.assertTrue(all("market" not in parse_qs(urlsplit(c.url).query) for c in reads))
+        self.assertEqual(len(self.venue.calls), 3)
+
+    def test_stats_retries_and_unconfirmed_clients_do_not_double_match(self):
+        self.placed()
+        entry = next(oid for oid, state in self.grid.All_orders.items() if not state[0] and state[2] == "buy")
+        self.record_fill(entry, fee="0.001")
+        self.grid.poller(self.exchange.fetch_open_orders())
+        self.venue.omit_result = self.venue.fail_confirm = True
+        before = set(self.venue.orders)
+        self.account.submit_orders()
+        uncertain = (set(self.venue.orders) - before).pop()
+        self.assertNotIn(uncertain, self.grid.order_stats)
+        self.record_fill(uncertain, price="2000", fee="0.001", offset=2000)
+        self.refresh_stats_at()
+        self.assertIn(uncertain, self.grid.order_stats)
+        self.assertEqual(self.grid.stats["profit"], Decimal("0.008"))
+        self.venue.omit_result = self.venue.fail_confirm = False
+        self.account.submit_orders()
+        retry = next(oid for oid in self.grid.All_orders if oid not in before)
+        self.record_fill(retry, price="2000", fee="0.001", offset=3000)
+        self.refresh_stats_at(20000)
+        self.assertEqual(self.grid.stats["profit"], Decimal("0.007"))
+        self.assertEqual(self.grid.stats["volume"], Decimal("59.99"))
+
+    def test_stats_failure_is_atomic_and_time_window_recovers(self):
+        self.placed()
+        oid = next(iter(self.grid.All_orders))
+        self.record_fill(oid, "0.002")
+        self.refresh_stats_at()
+        original, watermark = dict(self.grid.stats), self.account.stats_until
+        self.record_fill(oid, "0.002", offset=2000)
+        self.venue.fill_page_size = 1
+        self.venue.fail_fill_page = 1
+        with patch("ondo_grid.time.time", return_value=(self.account.stats_started + 80000) / 1000):
+            self.account.refresh_stats()
+        self.assertTrue(self.account.stats_stale)
+        self.assertEqual(self.grid.stats, original)
+        self.assertEqual(self.account.stats_until, watermark)
+        self.assertEqual(len(self.account.stats_fills), 1)
+        self.venue.fail_fill_page = None
+        self.refresh_stats_at(80000)
+        self.assertEqual(len(self.account.stats_fills), 2)
+        self.venue.calls.clear()
+        self.refresh_stats_at(90000)
+        query = parse_qs(urlsplit(self.venue.calls[0].url).query)
+        self.assertEqual(int(query["startTime"][0]), self.account.stats_started + 20000)
+        self.assertEqual(int(query["endTime"][0]), self.account.stats_started + 90000)
+        self.assertEqual(self.grid.stats["volume"], Decimal("7.996"))
+
+    def test_stats_invalid_data_and_duplicate_conflicts_keep_last_totals(self):
+        self.placed()
+        oid = next(iter(self.grid.All_orders))
+        fill = self.record_fill(oid, "0.002")
+        self.refresh_stats_at()
+        original, watermark = dict(self.grid.stats), self.account.stats_until
+        clock = patch("ondo_grid.time.time", return_value=(self.account.stats_started + 10000) / 1000)
+        clock.start()
+        self.addCleanup(clock.stop)
+        for key, value in (("fee", "nan"), ("isMaker", "false"), ("filledCost", "0"),
+                           ("side", "sell"), ("time", "bad time"), ("id", "")):
+            with self.subTest(key=key), patch.dict(fill, {key: value}):
+                self.account.refresh_stats()
+                self.assertTrue(self.account.stats_stale)
+                self.assertEqual(self.grid.stats, original)
+                self.assertEqual(self.account.stats_until, watermark)
+        for response in ({"result": None}, {"result": [], "pageInfo": {"nextCursor": "same"}}):
+            with patch.object(self.exchange, "_request", return_value=response):
+                self.account.refresh_stats()
+            self.assertTrue(self.account.stats_stale)
+            self.assertEqual(self.grid.stats, original)
+        self.venue.fills.append(dict(fill, filledCost="10"))
+        self.account.refresh_stats()
+        self.assertTrue(self.account.stats_stale)
+        self.assertEqual(self.grid.stats, original)
+
+    def test_stats_errors_do_not_stop_trading_or_increment_critical_errors(self):
+        with patch.object(self.exchange, "fetch_fills", side_effect=OndoAPIError("429", status=429)):
+            self.run_loops(51)
+        self.assertEqual(self.account.myloop, 51)
+        self.assertEqual(self.account.critical_errors, 0)
+        self.assertTrue(self.account.stats_stale)
+        self.assertEqual(len(self.grid.All_orders), 60)
+        self.account.display(self.exchange.fetch_open_orders())
+        message = self.logger.info.call_args.args[0]
+        self.assertIn("统计滞后", message)
+        for label in ("交易量(U)", "Maker单", "Taker单", "累计手续费(U)", "网格净利(U)"):
+            self.assertIn(label, message)
+        self.assertNotIn("grid_", message)
+
+    def test_stats_new_process_does_not_include_old_grid_clients(self):
+        self.placed()
+        self.record_fill(next(iter(self.grid.All_orders)))
+        self.refresh_stats_at()
+        self.account = AccountTrader(self.exchange)
+        self.grid = self.account.grids["ETH-USD.P"]
+        self.refresh_stats_at()
+        self.assertEqual(self.grid.stats["volume"], 0)
+        self.assertEqual(self.grid.stats["profit"], 0)
 
     def test_example_config_and_syntax(self):
         root = Path(__file__).resolve().parents[1]
