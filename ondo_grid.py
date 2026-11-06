@@ -314,7 +314,14 @@ class AccountTrader:
                 if (known and client and known != client) or source["symbol"] != symbol:
                     raise ValueError("Conflicting fill ownership")
                 fill_id = raw["id"]
-                stamp = datetime.fromisoformat(raw["time"].replace("Z", "+00:00"))
+                parts = re.fullmatch(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})",
+                                     raw["time"])
+                if parts is None:
+                    raise ValueError("Invalid Ondo fill timestamp")
+                seconds, fraction, zone = parts.groups()
+                # Python 3.10 只支持固定小数位；纳秒截断为微秒，不向下一毫秒进位。
+                stamp = datetime.fromisoformat(seconds + ("." + fraction[:6].ljust(6, "0") if fraction else "")
+                                               + ("+00:00" if zone == "Z" else zone))
                 size, price, cost, fee, rebate = (Decimal(str(raw.get(key, "0"))) for key in
                                                 ("size", "price", "filledCost", "fee", "feeRebate"))
                 if (not isinstance(fill_id, str) or not fill_id or not isinstance(order_id, str)

@@ -45,6 +45,7 @@ class Venue:
         self.position = 0
         self.pnl = 0
         self.fills = []
+        self.fill_times = {}
         self.fill_page_size = 0
         self.fail_fill_page = None
         self.markets = [{
@@ -128,8 +129,13 @@ class Venue:
             result = {"successfulCancels": successful, "failedCancels": failed}
         elif path == "/v1/perps/fills":
             start, end = int(query["startTime"][0]), int(query["endTime"][0])
-            result = [dict(fill) for fill in self.fills
-                      if start <= round(datetime.fromisoformat(fill["time"]).timestamp() * 1000) <= end]
+            result = []
+            for fill in self.fills:
+                # 模拟服务按独立的数值时间筛选，原始字符串留给客户端解析。
+                timestamp = (self.fill_times[fill["id"]] if fill["id"] in self.fill_times else
+                             round(datetime.fromisoformat(fill["time"]).timestamp() * 1000))
+                if start <= timestamp <= end:
+                    result.append(dict(fill))
             result.reverse()
             if self.fill_page_size:
                 start = int(query.get("cursor", ["0"])[0])
@@ -847,6 +853,7 @@ class GridTests(unittest.TestCase):
                 "fee": fee, "feeRebate": rebate, "isMaker": maker,
                 "time": datetime.fromtimestamp((self.account.stats_started + offset) / 1000, timezone.utc).isoformat()}
         self.venue.fills.append(fill)
+        self.venue.fill_times[fill["id"]] = self.account.stats_started + offset
         order["filledSize"] = str(Decimal(order["filledSize"]) + size)
         if Decimal(order["filledSize"]) == Decimal(order["size"]):
             order["status"] = "fullyfilled"
@@ -864,6 +871,82 @@ class GridTests(unittest.TestCase):
         created = set(self.grid.All_orders) - before
         self.assertEqual(len(created), 1)
         return created.pop()
+
+    def test_stats_real_nanosecond_timestamps_update_all_columns(self):
+        self.placed()
+        self.account.stats_started = int(datetime(2026, 11, 6, 19, tzinfo=timezone.utc).timestamp() * 1000)
+        self.account.stats_until = self.account.stats_started
+        samples = [
+            ("2026-11-06T19:03:13.793836979+00:00", 193793),
+            ("2026-11-06T19:03:56.241825909+00:00", 236241),
+            ("2026-11-06T19:04:37.657815764+00:00", 277657),
+            ("2026-11-06T19:05:25.093803626+00:00", 325093),
+            ("2026-11-06T19:06:12.693791391+00:00", 372693),
+        ]
+        order_id = next(oid for oid, state in self.grid.All_orders.items() if not state[0] and state[2] == "buy")
+        for index, (stamp, offset) in enumerate(samples):
+            fill = self.record_fill(order_id, fee="0.001", maker=index % 2 == 0, offset=offset)
+            fill["time"] = stamp
+            if index < 3:
+                order_id = self.replace_filled()
+            elif index == 3:
+                order_id = next(oid for oid, state in self.grid.All_orders.items()
+                                if not state[0] and state[2] == "sell" and self.grid.order_stats[oid]["entry"])
+        self.refresh_stats_at(400000)
+        self.assertEqual(self.grid.stats, dict(volume=Decimal("99.99"), fees=Decimal("0.005"),
+                                              profit=Decimal("0.015"), makers=3, takers=2))
+        for index, (_, offset) in enumerate(samples, 1):
+            self.assertEqual(self.account.stats_fills[f"fill-{index}"]["time"], self.account.stats_started + offset)
+        self.account.display(self.exchange.fetch_open_orders())
+        self.assertNotIn("统计滞后", self.logger.info.call_args.args[0])
+
+    def test_stats_timestamp_precisions_zones_and_millisecond_boundaries(self):
+        self.placed()
+        self.account.stats_started = int(datetime(2026, 11, 6, 19, tzinfo=timezone.utc).timestamp() * 1000)
+        self.account.stats_until = self.account.stats_started
+        order_id = next(iter(self.grid.All_orders))
+        for head, zone in (("2026-11-06T19:00:01", "Z"), ("2026-11-06T19:00:01", "+00:00"),
+                           ("2026-11-07T00:30:01", "+05:30"), ("2026-11-06T15:00:01", "-04:00")):
+            for fraction in ("", "1", "12", "123", "1234", "12345", "123456", "1234567",
+                             "12345678", "123456789", "999999999", "000000001"):
+                with self.subTest(zone=zone, fraction=fraction):
+                    self.venue.fills.clear()
+                    self.venue.fill_times.clear()
+                    self.account.stats_fills.clear()
+                    self.venue.orders[order_id]["filledSize"] = "0"
+                    offset = 1000 + int((fraction + "000")[:3])
+                    fill = self.record_fill(order_id, size="0.001", offset=offset)
+                    fill["time"] = head + ("." + fraction if fraction else "") + zone
+                    self.refresh_stats_at(10000)
+                    self.assertEqual(self.account.stats_fills[fill["id"]]["time"], self.account.stats_started + offset)
+                    self.assertEqual(self.grid.stats["volume"], Decimal("1.999"))
+        # 用真实纳秒样例跨过毫秒窗口边界，不能把 .999999999 四舍五入到下一秒。
+        self.account.stats_until = self.account.stats_started
+        self.account.stats_fills.clear()
+        fill["time"] = "2026-11-06T19:00:01.999999999Z"
+        self.venue.fill_times[fill["id"]] = self.account.stats_started + 1999
+        self.refresh_stats_at(1998)
+        self.assertEqual(self.grid.stats["volume"], 0)
+        self.refresh_stats_at(1999)
+        self.assertEqual(self.account.stats_fills[fill["id"]]["time"], self.account.stats_started + 1999)
+        self.refresh_stats_at(2000)
+        self.assertEqual(len(self.account.stats_fills), 1)
+        self.assertEqual(self.grid.stats["volume"], Decimal("1.999"))
+
+    def test_stats_invalid_timestamp_keeps_previous_snapshot(self):
+        self.placed()
+        fill = self.record_fill(next(iter(self.grid.All_orders)), size="0.001")
+        self.refresh_stats_at()
+        previous, watermark = dict(self.grid.stats), self.account.stats_until
+        for stamp in ("2026-11-06T19:00:01.123456789", "2026-02-30T19:00:01.123456789Z",
+                      "2026-11-06T19:00:01.123456789+25:00", "2026-11-06T19:00:01.badZ",
+                      "2026-11-06T19:00:01.1234567890Z"):
+            with self.subTest(stamp=stamp), patch.dict(fill, {"time": stamp}), \
+                 patch("ondo_grid.time.time", return_value=(self.account.stats_started + 10000) / 1000):
+                self.account.refresh_stats()
+                self.assertTrue(self.account.stats_stale)
+                self.assertEqual(self.grid.stats, previous)
+                self.assertEqual(self.account.stats_until, watermark)
 
     def test_stats_partial_mixed_roles_and_signed_fees(self):
         self.placed()
